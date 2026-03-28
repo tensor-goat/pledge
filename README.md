@@ -62,7 +62,7 @@ Violations return `EPERM` (or kill the process, your choice). The restriction is
 **1. Drop the file into your project:**
 
 ```bash
-curl -O https://raw.githubusercontent.com/youruser/pledge-py/main/pledge.py
+curl -O https://raw.githubusercontent.com/tensor-goat/pledge/refs/heads/main/pledge.py
 # or just copy pledge.py into your project directory
 ```
 
