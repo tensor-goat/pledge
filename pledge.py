@@ -56,6 +56,7 @@ import os
 import platform
 import struct
 import sys
+from dataclasses import dataclass
 from typing import Optional
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -994,6 +995,354 @@ def pledge_available() -> bool:
         return False
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# unveil() — filesystem path restriction via Landlock LSM
+# ═══════════════════════════════════════════════════════════════════════
+
+# Landlock syscall numbers (same on all architectures — added in 5.13)
+SYS_landlock_create_ruleset = 444
+SYS_landlock_add_rule       = 445
+SYS_landlock_restrict_self  = 446
+
+# Landlock ABI version query flag
+LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
+
+# Landlock rule types
+LANDLOCK_RULE_PATH_BENEATH = 1
+LANDLOCK_RULE_NET_PORT     = 2   # ABI v4+
+
+# Landlock filesystem access rights (ABI v1)
+LANDLOCK_ACCESS_FS_EXECUTE       = 1 << 0
+LANDLOCK_ACCESS_FS_WRITE_FILE    = 1 << 1
+LANDLOCK_ACCESS_FS_READ_FILE     = 1 << 2
+LANDLOCK_ACCESS_FS_READ_DIR      = 1 << 3
+LANDLOCK_ACCESS_FS_REMOVE_DIR    = 1 << 4
+LANDLOCK_ACCESS_FS_REMOVE_FILE   = 1 << 5
+LANDLOCK_ACCESS_FS_MAKE_CHAR     = 1 << 6
+LANDLOCK_ACCESS_FS_MAKE_DIR      = 1 << 7
+LANDLOCK_ACCESS_FS_MAKE_REG      = 1 << 8
+LANDLOCK_ACCESS_FS_MAKE_SOCK     = 1 << 9
+LANDLOCK_ACCESS_FS_MAKE_FIFO     = 1 << 10
+LANDLOCK_ACCESS_FS_MAKE_BLOCK    = 1 << 11
+LANDLOCK_ACCESS_FS_MAKE_SYM      = 1 << 12
+# ABI v2
+LANDLOCK_ACCESS_FS_REFER         = 1 << 13
+# ABI v3
+LANDLOCK_ACCESS_FS_TRUNCATE      = 1 << 14
+# ABI v4
+LANDLOCK_ACCESS_FS_IOCTL_DEV     = 1 << 15
+
+# Convenience groups matching OpenBSD unveil permission letters
+_UNVEIL_READ = (
+    LANDLOCK_ACCESS_FS_READ_FILE |
+    LANDLOCK_ACCESS_FS_READ_DIR
+)
+_UNVEIL_WRITE = (
+    LANDLOCK_ACCESS_FS_WRITE_FILE |
+    LANDLOCK_ACCESS_FS_TRUNCATE     # ABI v3, silently ignored on older
+)
+_UNVEIL_EXEC = (
+    LANDLOCK_ACCESS_FS_EXECUTE
+)
+_UNVEIL_CREATE = (
+    LANDLOCK_ACCESS_FS_MAKE_REG |
+    LANDLOCK_ACCESS_FS_MAKE_DIR |
+    LANDLOCK_ACCESS_FS_MAKE_SYM |
+    LANDLOCK_ACCESS_FS_MAKE_SOCK |
+    LANDLOCK_ACCESS_FS_MAKE_FIFO |
+    LANDLOCK_ACCESS_FS_MAKE_CHAR |
+    LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+    LANDLOCK_ACCESS_FS_REMOVE_FILE |
+    LANDLOCK_ACCESS_FS_REMOVE_DIR |
+    LANDLOCK_ACCESS_FS_REFER
+)
+
+# All ABI-v1 rights (used as the handled_access_fs bitmask)
+_LANDLOCK_ACCESS_FS_ALL_V1 = (
+    LANDLOCK_ACCESS_FS_EXECUTE |
+    LANDLOCK_ACCESS_FS_WRITE_FILE |
+    LANDLOCK_ACCESS_FS_READ_FILE |
+    LANDLOCK_ACCESS_FS_READ_DIR |
+    LANDLOCK_ACCESS_FS_REMOVE_DIR |
+    LANDLOCK_ACCESS_FS_REMOVE_FILE |
+    LANDLOCK_ACCESS_FS_MAKE_CHAR |
+    LANDLOCK_ACCESS_FS_MAKE_DIR |
+    LANDLOCK_ACCESS_FS_MAKE_REG |
+    LANDLOCK_ACCESS_FS_MAKE_SOCK |
+    LANDLOCK_ACCESS_FS_MAKE_FIFO |
+    LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+    LANDLOCK_ACCESS_FS_MAKE_SYM
+)
+
+
+# ctypes structures for Landlock
+
+class LandlockRulesetAttr(ctypes.Structure):
+    """struct landlock_ruleset_attr { __u64 handled_access_fs; __u64 handled_access_net; }"""
+    _fields_ = [
+        ("handled_access_fs",  ctypes.c_uint64),
+        ("handled_access_net", ctypes.c_uint64),
+    ]
+
+
+class LandlockPathBeneathAttr(ctypes.Structure):
+    """struct landlock_path_beneath_attr { __u64 allowed_access; __s32 parent_fd; }"""
+    _fields_ = [
+        ("allowed_access", ctypes.c_uint64),
+        ("parent_fd",      ctypes.c_int32),
+    ]
+    _pack_ = 1  # avoid padding between fields
+
+
+def _landlock_create_ruleset(attr: Optional[LandlockRulesetAttr],
+                             size: int, flags: int) -> int:
+    """landlock_create_ruleset(2) via raw syscall."""
+    libc = _get_libc()
+    libc.syscall.restype = ctypes.c_long
+    if attr is None:
+        ret = libc.syscall(
+            ctypes.c_long(SYS_landlock_create_ruleset),
+            ctypes.c_long(0),  # NULL
+            ctypes.c_long(size),
+            ctypes.c_long(flags),
+        )
+    else:
+        ret = libc.syscall(
+            ctypes.c_long(SYS_landlock_create_ruleset),
+            ctypes.byref(attr),
+            ctypes.c_long(size),
+            ctypes.c_long(flags),
+        )
+    if ret < 0:
+        e = ctypes.get_errno()
+        raise OSError(e, f"landlock_create_ruleset: {os.strerror(e)}")
+    return ret
+
+
+def _landlock_add_rule(ruleset_fd: int, rule_type: int,
+                       rule_attr, flags: int = 0) -> int:
+    """landlock_add_rule(2) via raw syscall."""
+    libc = _get_libc()
+    libc.syscall.restype = ctypes.c_long
+    ret = libc.syscall(
+        ctypes.c_long(SYS_landlock_add_rule),
+        ctypes.c_long(ruleset_fd),
+        ctypes.c_long(rule_type),
+        ctypes.byref(rule_attr),
+        ctypes.c_long(flags),
+    )
+    if ret < 0:
+        e = ctypes.get_errno()
+        raise OSError(e, f"landlock_add_rule: {os.strerror(e)}")
+    return ret
+
+
+def _landlock_restrict_self(ruleset_fd: int, flags: int = 0) -> int:
+    """landlock_restrict_self(2) via raw syscall."""
+    libc = _get_libc()
+    libc.syscall.restype = ctypes.c_long
+    ret = libc.syscall(
+        ctypes.c_long(SYS_landlock_restrict_self),
+        ctypes.c_long(ruleset_fd),
+        ctypes.c_long(flags),
+    )
+    if ret < 0:
+        e = ctypes.get_errno()
+        raise OSError(e, f"landlock_restrict_self: {os.strerror(e)}")
+    return ret
+
+
+def _landlock_abi_version() -> int:
+    """Query the Landlock ABI version.  Returns 0 if unavailable."""
+    try:
+        return _landlock_create_ruleset(
+            None, 0, LANDLOCK_CREATE_RULESET_VERSION)
+    except OSError:
+        return 0
+
+
+def _access_mask_for_abi(abi: int) -> int:
+    """Return the full handled_access_fs bitmask for a given ABI version."""
+    mask = _LANDLOCK_ACCESS_FS_ALL_V1
+    if abi >= 2:
+        mask |= LANDLOCK_ACCESS_FS_REFER
+    if abi >= 3:
+        mask |= LANDLOCK_ACCESS_FS_TRUNCATE
+    if abi >= 4:
+        mask |= LANDLOCK_ACCESS_FS_IOCTL_DEV
+    return mask
+
+
+def _perms_to_access(perms: str, is_dir: bool) -> int:
+    """Convert an OpenBSD-style permission string to Landlock access bits.
+
+    Permission characters:
+        r  — read (rpath)
+        w  — write (wpath)
+        x  — execute (exec)
+        c  — create / remove (cpath)
+    """
+    access = 0
+    for ch in perms:
+        match ch:
+            case "r":
+                access |= _UNVEIL_READ
+            case "w":
+                access |= _UNVEIL_WRITE
+            case "x":
+                access |= _UNVEIL_EXEC
+            case "c":
+                if is_dir:
+                    access |= _UNVEIL_CREATE
+            case _:
+                raise ValueError(f"unveil: unknown permission '{ch}' "
+                                 "(expected r/w/x/c)")
+    return access
+
+
+# ── Unveil state ──
+# Landlock requires all rules to be added to a ruleset before calling
+# landlock_restrict_self().  OpenBSD's unveil() takes effect
+# incrementally, but on Linux we must batch: collect rules, then
+# commit with unveil(None, None).
+
+@dataclass
+class _UnveilRule:
+    path: str
+    access: int
+
+class _UnveilState:
+    """Tracks pending unveil rules before they are committed."""
+
+    def __init__(self):
+        self.rules: list[_UnveilRule] = []
+        self.committed = False
+        self.abi = _landlock_abi_version()
+
+    def add(self, path: str, permissions: str) -> None:
+        if self.committed:
+            raise OSError(errno.EPERM,
+                          "unveil: cannot add rules after committing "
+                          "(already called unveil(None, None))")
+        real = os.path.realpath(path)
+        is_dir = os.path.isdir(real)
+        access = _perms_to_access(permissions, is_dir)
+        self.rules.append(_UnveilRule(real, access))
+
+    def commit(self) -> None:
+        if self.committed:
+            return  # already committed, no-op
+        if self.abi == 0:
+            raise OSError(errno.ENOSYS,
+                          "unveil: Landlock not supported by this kernel "
+                          "(requires >= 5.13)")
+
+        handled = _access_mask_for_abi(self.abi)
+
+        # Create ruleset
+        attr = LandlockRulesetAttr()
+        attr.handled_access_fs = handled
+        attr.handled_access_net = 0
+        ruleset_fd = _landlock_create_ruleset(
+            attr, ctypes.sizeof(attr), 0)
+
+        try:
+            # Add each rule
+            for rule in self.rules:
+                path_fd = os.open(rule.path,
+                                  os.O_PATH | os.O_CLOEXEC)
+                try:
+                    path_attr = LandlockPathBeneathAttr()
+                    # Intersect requested access with what this ABI handles
+                    path_attr.allowed_access = rule.access & handled
+                    path_attr.parent_fd = path_fd
+                    _landlock_add_rule(ruleset_fd,
+                                      LANDLOCK_RULE_PATH_BENEATH,
+                                      path_attr, 0)
+                finally:
+                    os.close(path_fd)
+
+            # Enforce
+            _prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+            _landlock_restrict_self(ruleset_fd, 0)
+        finally:
+            os.close(ruleset_fd)
+
+        self.committed = True
+
+
+_unveil_state: Optional[_UnveilState] = None
+
+
+def unveil(path: Optional[str] = None,
+           permissions: Optional[str] = None) -> None:
+    """
+    Restrict filesystem access to only unveiled paths.
+
+    This is the companion to pledge().  While pledge() controls *which
+    system calls* are allowed, unveil() controls *which filesystem paths*
+    are accessible.
+
+    Usage follows the OpenBSD convention:
+
+        unveil("/usr",    "r")       # read-only access to /usr
+        unveil("/tmp",    "rwc")     # read, write, create in /tmp
+        unveil(".",       "rwc")     # full access to cwd
+        unveil(None,      None)      # commit — no more unveils allowed
+
+    After committing, the process can only access the unveiled paths with
+    the specified permissions.  All other filesystem access returns EACCES.
+
+    Permission characters:
+        r   Read files and list directories (rpath)
+        w   Write to files (wpath)
+        x   Execute files (exec)
+        c   Create and remove files/dirs (cpath)
+
+    Args:
+        path: Filesystem path to unveil.  May be a file or directory.
+              Directories include everything underneath them.
+              Pass None to commit (lock) the ruleset.
+        permissions: Permission string (any combination of "r", "w", "x", "c").
+                     Pass None when committing.
+
+    Raises:
+        OSError: If Landlock is not available (kernel < 5.13) or if
+                 rules have already been committed.
+        ValueError: If an unknown permission character is used.
+
+    Note:
+        On Linux, unveil rules are collected and only take effect when
+        you call unveil(None, None) to commit.  This differs from OpenBSD
+        where each unveil() call takes effect immediately.
+
+    Example:
+        >>> unveil("/etc", "r")
+        >>> unveil("/tmp", "rwc")
+        >>> unveil(None, None)       # commit
+        >>> open("/etc/hostname").read()   # works
+        >>> open("/home/user/secrets")     # EACCES
+    """
+    global _unveil_state
+
+    if _unveil_state is None:
+        _unveil_state = _UnveilState()
+
+    if path is None and permissions is None:
+        _unveil_state.commit()
+    elif path is not None and permissions is not None:
+        _unveil_state.add(path, permissions)
+    else:
+        raise ValueError(
+            "unveil: both path and permissions must be None (to commit) "
+            "or both must be strings")
+
+
+def unveil_available() -> bool:
+    """Check if unveil (Landlock) is available on this system."""
+    return _landlock_abi_version() > 0
+
+
 def _is_dynamic_elf(path: str) -> bool:
     """Check if a file is a dynamically linked ELF binary.
 
@@ -1045,26 +1394,34 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="pledge",
-        description="Run a command under OpenBSD-style pledge() restrictions.",
+        description="Run a command under OpenBSD-style pledge()+unveil() restrictions.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "promise categories:\n  "
             + ", ".join(all_promises)
-            + "\n\nexamples:\n"
+            + "\n\nunveil permissions:\n"
+            "  r=read  w=write  x=execute  c=create/remove\n"
+            "\nexamples:\n"
             "  pledge -p 'stdio rpath' ls -la\n"
-            "  pledge -p 'stdio rpath wpath cpath' -- bash\n"
-            "  pledge -p 'stdio rpath inet dns' -- curl -s http://example.com\n"
-            "  pledge --test              # check if seccomp is available\n"
+            "  pledge -p 'stdio rpath wpath cpath' -v rwc:. -- bash\n"
+            "  pledge -p 'stdio rpath' -v /etc -v /usr -- cat /etc/hostname\n"
+            "  pledge --test              # check system capabilities\n"
         ),
     )
     parser.add_argument("-p", "--promises", default="stdio rpath",
                         help="space-separated promise list "
                              "(default: 'stdio rpath')")
+    parser.add_argument("-v", "--unveil", action="append", default=[],
+                        metavar="[PERM:]PATH",
+                        help="unveil PATH with permissions (default: r). "
+                             "PERM is any combo of r,w,x,c. Repeatable.")
+    parser.add_argument("-V", "--no-unveil", action="store_true",
+                        help="disable unveil (only pledge, no path restrictions)")
     parser.add_argument("--penalty", choices=["eperm", "kill"],
                         default="eperm",
                         help="violation penalty (default: eperm)")
     parser.add_argument("--test", action="store_true",
-                        help="test if seccomp is available and exit")
+                        help="test if seccomp/landlock are available and exit")
     parser.add_argument("--dump", action="store_true",
                         help="dump BPF program stats and exit")
     parser.add_argument("command", nargs="*",
@@ -1073,15 +1430,19 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.test:
+        kv = platform.release()
+        print(f"kernel:    {kv}")
+        print(f"arch:      {_arch} (AUDIT_ARCH=0x{AUDIT_ARCH:08X})")
         if pledge_available():
-            print("pledge: seccomp BPF is available")
-            kv = platform.release()
-            print(f"  kernel:  {kv}")
-            print(f"  arch:    {_arch} (AUDIT_ARCH=0x{AUDIT_ARCH:08X})")
-            sys.exit(0)
+            print(f"pledge:    available (seccomp BPF)")
         else:
-            print("pledge: seccomp BPF is NOT available", file=sys.stderr)
-            sys.exit(1)
+            print(f"pledge:    NOT available")
+        abi = _landlock_abi_version()
+        if abi > 0:
+            print(f"unveil:    available (Landlock ABI v{abi})")
+        else:
+            print(f"unveil:    NOT available (needs kernel >= 5.13)")
+        sys.exit(0 if pledge_available() else 1)
 
     if args.dump:
         promise_set = set(args.promises.split())
@@ -1150,12 +1511,35 @@ def main() -> None:
     bpf_prog = builder.build()
     n_insns = len(bpf_prog) // _SOCK_FILTER_SIZE
 
-    # Install filter
+    # Install seccomp filter (pledge)
     try:
         _install_filter(bpf_prog)
     except OSError as e:
         print(f"pledge: cannot install seccomp filter: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Install unveil rules (Landlock) if -v flags were provided
+    if args.unveil and not args.no_unveil:
+        abi = _landlock_abi_version()
+        if abi == 0:
+            print("pledge: warning: unveil not available (kernel < 5.13), "
+                  "skipping path restrictions", file=sys.stderr)
+        else:
+            for vspec in args.unveil:
+                if ":" in vspec and len(vspec.split(":", 1)[0]) <= 4:
+                    perms, path = vspec.split(":", 1)
+                else:
+                    perms, path = "r", vspec
+                try:
+                    unveil(path, perms)
+                except (OSError, ValueError) as e:
+                    print(f"pledge: unveil {path}: {e}", file=sys.stderr)
+                    sys.exit(1)
+            try:
+                unveil(None, None)
+            except OSError as e:
+                print(f"pledge: unveil commit: {e}", file=sys.stderr)
+                sys.exit(1)
 
     # exec the command
     try:
