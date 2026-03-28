@@ -3,6 +3,15 @@
 **OpenBSD `pledge(2)` for Linux — in pure Python**
 
 A single-file, zero-dependency Python port of [Justine Tunney's pledge()](https://justine.lol/pledge/) that uses `ctypes` to build and install SECCOMP BPF filters at runtime. No C compiler, no `pip install`, no root required.
+A strong fit for:
+
+- running LLM-generated Python
+- sandboxing agent tool calls
+- isolating plugin ecosystems
+- hardening eval runners
+- constraining retrieval / scraping / ETL workers
+- building safer local AI apps
+-  protecting CI and automation jobs from accidental overreach
 
 ```python
 from pledge import pledge
