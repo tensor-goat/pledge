@@ -1,15 +1,23 @@
 # pledge.py
 
-**OpenBSD `pledge(2)` for Linux — in pure Python**
+**OpenBSD `pledge(2)` + `unveil(2)` for Linux — in pure Python**
 
-A single-file, zero-dependency Python port of [Justine Tunney's pledge()](https://justine.lol/pledge/) that uses `ctypes` to build and install SECCOMP BPF filters at runtime. No C compiler, no `pip install`, no root required.
+A single-file, zero-dependency Python port of [Justine Tunney's pledge()](https://justine.lol/pledge/) that uses `ctypes` to build and install SECCOMP BPF filters and Landlock LSM rulesets at runtime. No C compiler, no `pip install`, no root required.
 
 ```python
-from pledge import pledge
+from pledge import pledge, unveil
 
-pledge("stdio rpath")          # only allow basic I/O and reading files
-data = open("/etc/hosts").read()  # ✓ works
-os.system("curl evil.com")        # ✗ Operation not permitted
+# Control WHAT the process can do
+pledge("stdio rpath wpath")
+
+# Control WHERE the process can do it
+unveil("/etc",  "r")       # read-only
+unveil("/tmp",  "rwc")     # read + write + create
+unveil(None,    None)       # commit — lock it down
+
+open("/etc/hostname").read()   # ✓ allowed path, allowed operation
+open("/home/user/secrets")     # ✗ path not unveiled
+os.system("curl evil.com")     # ✗ no inet promise
 ```
 
 ---
@@ -17,10 +25,15 @@ os.system("curl evil.com")        # ✗ Operation not permitted
 ## Table of Contents
 
 - [Why](#why)
+- [The Two Halves of the Sandbox](#the-two-halves-of-the-sandbox)
 - [Quick Start](#quick-start)
 - [Command-Line Usage](#command-line-usage)
-- [Library Usage](#library-usage)
+- [Library API](#library-api)
+  - [pledge()](#pledgepromises-str---none)
+  - [unveil()](#unveilpath-str--none-permissions-str--none---none)
+  - [Availability Checks](#availability-checks)
 - [Promise Reference](#promise-reference)
+- [Unveil Permission Reference](#unveil-permission-reference)
 - [Argument Filtering](#argument-filtering)
 - [Examples](#examples)
   - [Sandboxing a Config Parser](#sandboxing-a-config-parser)
@@ -32,6 +45,10 @@ os.system("curl evil.com")        # ✗ Operation not permitted
   - [Locked-Down Web Scraper](#locked-down-web-scraper)
   - [Protecting a CLI Tool From Itself](#protecting-a-cli-tool-from-itself)
   - [Sandboxing AI Code Execution](#sandboxing-ai-code-execution)
+  - [pledge + unveil Together: Full Sandbox](#pledge--unveil-together-full-sandbox)
+  - [Web Server With Minimal Exposure](#web-server-with-minimal-exposure)
+  - [Read-Only Config With Private Temp](#read-only-config-with-private-temp)
+  - [Build System Sandbox](#build-system-sandbox)
 - [Command-Line Examples](#command-line-examples)
 - [How It Works](#how-it-works)
 - [Architecture Support](#architecture-support)
@@ -42,18 +59,56 @@ os.system("curl evil.com")        # ✗ Operation not permitted
 
 ## Why
 
-Linux has powerful sandboxing via SECCOMP BPF, but using it normally requires writing raw BPF bytecode — an inscrutable stream of bitwise operations and jump offsets. OpenBSD's `pledge()` distills the same idea into a single function call with a human-readable string.
+Linux has powerful sandboxing mechanisms, but they are famously hard to use:
 
-This library gives you that same simplicity on Linux:
+- **SECCOMP BPF** controls which syscalls are allowed, but requires writing raw BPF bytecode — an inscrutable chain of bitwise operations and forward-only jumps.
+- **Landlock LSM** controls which filesystem paths are accessible, but has a three-syscall ceremony (`landlock_create_ruleset` → `landlock_add_rule` → `landlock_restrict_self`) with no glibc wrappers.
+
+OpenBSD distills both ideas into two simple calls:
 
 ```python
-# Before pledge: your process can do anything
-pledge("stdio rpath")
-# After pledge: it can only do basic I/O and read files
-# This is enforced by the kernel — it cannot be reversed
+pledge("stdio rpath")         # what operations are allowed
+unveil("/data", "r")          # what paths are visible
 ```
 
-Violations return `EPERM` (or kill the process, your choice). The restriction is enforced by the kernel itself, so even native code loaded via `ctypes` or C extensions is constrained. 
+This library gives you exactly that API on Linux. One function call, one human-readable string, kernel-enforced.
+
+---
+
+## The Two Halves of the Sandbox
+
+`pledge()` and `unveil()` solve different problems and are most powerful when used together:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         Your Process                             │
+│                                                                  │
+│   pledge("stdio rpath wpath")      unveil("/data", "rw")        │
+│   ┌─────────────────────────┐      ┌──────────────────────────┐  │
+│   │  Controls OPERATIONS    │      │  Controls PATHS          │  │
+│   │                         │      │                          │  │
+│   │  ✓ read/write files     │      │  ✓ /data (read+write)    │  │
+│   │  ✓ basic I/O            │      │  ✗ /etc (hidden)         │  │
+│   │  ✗ network sockets      │      │  ✗ /home (hidden)        │  │
+│   │  ✗ fork processes       │      │  ✗ everything else       │  │
+│   │  ✗ execute programs     │      │                          │  │
+│   │                         │      │                          │  │
+│   │  SECCOMP BPF            │      │  Landlock LSM            │  │
+│   │  (kernel ≥ 3.5)         │      │  (kernel ≥ 5.13)         │  │
+│   └─────────────────────────┘      └──────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+| | `pledge()` only | `unveil()` only | Both together |
+|---|---|---|---|
+| Can the process open sockets? | Controlled | Not controlled | Controlled |
+| Can the process read `/etc/shadow`? | Allowed (if `rpath`) | Controlled | Controlled |
+| Can the process write to `/tmp`? | Allowed (if `wpath`) | Controlled | Controlled |
+| Can the process fork? | Controlled | Not controlled | Controlled |
+| **Kernel mechanism** | SECCOMP BPF | Landlock LSM | Both |
+| **Minimum kernel** | 3.5 | 5.13 | 5.13 |
+
+Using `pledge()` alone is still valuable — it prevents entire classes of operations (networking, process creation, etc.). Adding `unveil()` on top gives you path-level precision.
 
 ---
 
@@ -69,25 +124,31 @@ curl -O https://raw.githubusercontent.com/tensor-goat/pledge/refs/heads/main/ple
 **2. Use it in your code:**
 
 ```python
-from pledge import pledge
+from pledge import pledge, unveil
 
 # Do your setup (imports, open config files, etc.) FIRST
 import json
 config = json.load(open("config.json"))
 
-# Then lock down
-pledge("stdio")
+# Restrict paths (optional — requires kernel ≥ 5.13)
+unveil(".", "r")           # read-only access to working dir
+unveil(None, None)         # commit
 
-# From here on, only basic I/O works
-print(json.dumps(config))  # ✓ fine — just writing to stdout
-open("secrets.txt")        # ✗ EPERM — no rpath promise
+# Restrict operations
+pledge("stdio")            # only basic I/O from here on
+
+print(json.dumps(config))  # ✓ fine
+open("secrets.txt")        # ✗ EACCES (unveil) or EPERM (pledge)
 ```
 
 **3. Or wrap an existing command:**
 
 ```bash
+# pledge only — restrict operations
 python3 pledge.py -p "stdio rpath" -- cat /etc/hostname
-python3 pledge.py -p "stdio rpath" -- ls -la
+
+# pledge + unveil — restrict operations AND paths
+python3 pledge.py -p "stdio rpath" -v /etc -- cat /etc/hostname
 ```
 
 ---
@@ -95,22 +156,25 @@ python3 pledge.py -p "stdio rpath" -- ls -la
 ## Command-Line Usage
 
 ```
-pledge [-p PROMISES] [--penalty {eperm,kill}] [--test] [--dump] [command ...]
+pledge [-p PROMISES] [-v [PERM:]PATH] [-V] [--penalty {eperm,kill}]
+       [--test] [--dump] [command ...]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-p PROMISES` | Space-separated promise list (default: `stdio rpath`) |
+| `-v [PERM:]PATH` | Unveil a path. `PERM` defaults to `r`. Repeatable. |
+| `-V` | Disable unveiling (pledge only, no path restrictions) |
 | `--penalty eperm` | Violations return `EPERM` (default) |
 | `--penalty kill` | Violations kill the process with `SIGSYS` |
-| `--test` | Check if SECCOMP BPF is available on this system |
+| `--test` | Check if pledge/unveil are available on this system |
 | `--dump` | Print BPF program statistics for the given promises |
 
-When wrapping a command, pledge.py automatically adds the `exec`, `rpath`, and (for dynamically linked binaries) `prot_exec` promises, since they are needed to load and run the target program. It detects dynamic vs. static ELF binaries by scanning for `PT_INTERP` in the ELF program headers.
+When wrapping a command, the CLI automatically adds `exec`, `rpath`, and (for dynamically linked binaries) `prot_exec` promises. It detects dynamic vs. static ELF binaries by scanning for `PT_INTERP`.
 
 ---
 
-## Library Usage
+## Library API
 
 ### `pledge(promises: str) -> None`
 
@@ -126,25 +190,58 @@ pledge("stdio rpath wpath")
 - Calling `pledge()` is **irreversible**. You can call it again to narrow privileges further, but never to widen them.
 - Raises `ValueError` for unknown promise names.
 - Raises `OSError` if the filter cannot be installed.
+- Does not require root — uses `PR_SET_NO_NEW_PRIVS`.
 
-### `pledge_available() -> bool`
+### `unveil(path: str | None, permissions: str | None) -> None`
 
-Returns `True` if SECCOMP BPF is available on the current system.
+Restrict filesystem access to only the specified paths and permissions.
 
 ```python
-from pledge import pledge_available
+from pledge import unveil
+
+unveil("/usr",    "rx")      # read + execute
+unveil("/etc",    "r")       # read only
+unveil("/tmp",    "rwc")     # read + write + create
+unveil(".",       "rwc")     # current directory
+unveil(None,      None)      # commit — no more changes
+```
+
+- The first call to `unveil()` begins building an allowlist. The entire filesystem is hidden except for unveiled paths.
+- `unveil(None, None)` commits the ruleset. After committing, no more paths can be added.
+- On Linux, rules are batched and only take effect on commit (unlike OpenBSD where each call takes immediate effect).
+- Requires kernel ≥ 5.13 (Landlock LSM). On older kernels, raises `OSError` with `ENOSYS`.
+- Does not require root — uses `PR_SET_NO_NEW_PRIVS`.
+
+**Permission characters:**
+
+| Char | Meaning | Corresponding pledge promise |
+|------|---------|-----|
+| `r` | Read files, list directories | `rpath` |
+| `w` | Write to existing files | `wpath` |
+| `x` | Execute files | `exec` |
+| `c` | Create and remove files/directories | `cpath` |
+
+### Availability Checks
+
+```python
+from pledge import pledge_available, unveil_available
 
 if pledge_available():
     pledge("stdio rpath")
-else:
-    print("Warning: sandboxing not available on this kernel")
+
+if unveil_available():
+    unveil("/data", "r")
+    unveil(None, None)
 ```
+
+`pledge_available()` returns `True` on kernel ≥ 3.5 (almost all modern systems).
+`unveil_available()` returns `True` on kernel ≥ 5.13 with Landlock enabled.
 
 ---
 
 ## Promise Reference
 
-Every promise grants access to a specific group of system calls. Start with only what you need — the principle of least privilege.
+Every promise grants access to a specific group of system calls. Start with only what you need.
 
 | Promise | What it grants |
 |---------|---------------|
@@ -164,26 +261,49 @@ Every promise grants access to a specific group of system calls. Start with only
 | `thread` | Threading: `clone` (thread flags), `futex`, `mmap`/`mprotect` with `PROT_EXEC` |
 | `exec` | Execute programs: `execve`, `execveat` |
 | `prot_exec` | Executable memory: allow `PROT_EXEC` in `mmap`/`mprotect` (needed for dynamic linking, JIT) |
-| `id` | Identity changes: `setuid`, `setgid`, `setgroups`, `setfsuid`, `setfsgid`, `setreuid`, `setresuid` |
+| `id` | Identity changes: `setuid`, `setgid`, `setgroups`, `setfsuid`, `setfsgid` |
 | `recvfd` | Receive file descriptors: `recvmsg` (SCM_RIGHTS) |
 | `sendfd` | Send file descriptors: `sendmsg` (SCM_RIGHTS) |
 | `tmppath` | Temp file ops: `unlink`, `unlinkat`, `lstat` |
-| `vminfo` | System info: allows access to `/proc/stat`, `/proc/meminfo`, etc. (path-level; no extra syscalls) |
+| `vminfo` | System info: `/proc/stat`, `/proc/meminfo`, etc. |
+
+---
+
+## Unveil Permission Reference
+
+The `unveil()` permission string controls what operations are allowed on each path. Permissions are additive — `"rw"` means read and write.
+
+| Permission | Allowed operations | Landlock access rights |
+|---|---|---|
+| `r` | Read files, list directories, `stat`, `readlink` | `READ_FILE`, `READ_DIR` |
+| `w` | Write to existing files, truncate | `WRITE_FILE`, `TRUNCATE` (ABI v3+) |
+| `x` | Execute files (via `execve`) | `EXECUTE` |
+| `c` | Create files/dirs, remove files/dirs, rename, link, symlink | `MAKE_REG`, `MAKE_DIR`, `MAKE_SYM`, `REMOVE_FILE`, `REMOVE_DIR`, `REFER` |
+
+**Common combinations:**
+
+| String | Meaning | Typical use |
+|--------|---------|-------------|
+| `"r"` | Read-only | Config dirs, CA certs, shared libraries |
+| `"rw"` | Read and write | Log files, database files |
+| `"rx"` | Read and execute | `/usr/bin`, `/lib` |
+| `"rwc"` | Full file management | Working directories, `/tmp` |
+| `"rwxc"` | Everything | Rarely needed |
 
 ---
 
 ## Argument Filtering
 
-Unlike simple syscall allowlists, pledge.py applies **argument-level filtering** on several system calls, matching the behavior of the original C implementation:
+Unlike simple syscall allowlists, pledge.py applies **argument-level filtering** on several system calls:
 
 | Syscall | Filtering |
 |---------|-----------|
-| `open` / `openat` | Flags checked: `O_RDONLY` requires `rpath`, `O_WRONLY`/`O_RDWR` requires `wpath`, `O_CREAT` requires `cpath` |
-| `socket` | Address family checked: `AF_INET`/`AF_INET6` requires `inet` or `dns`, `AF_UNIX` requires `unix` |
+| `open` / `openat` | Flags checked: `O_RDONLY` needs `rpath`, `O_WRONLY`/`O_RDWR` needs `wpath`, `O_CREAT` needs `cpath` |
+| `socket` | Family checked: `AF_INET`/`AF_INET6` needs `inet` or `dns`, `AF_UNIX` needs `unix` |
 | `ioctl` | Command checked: `stdio` allows `FIONREAD`/`FIONBIO`/`FIOCLEX`/`FIONCLEX`; `tty` allows `TIOCGWINSZ`/`TCGETS`/`TCSETS*` |
-| `fcntl` | Command checked: `stdio` allows `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL`/`F_DUPFD_CLOEXEC`; `flock` allows `F_GETLK`/`F_SETLK`/`F_SETLKW` |
+| `fcntl` | Command checked: `stdio` allows `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL`; `flock` allows `F_GETLK`/`F_SETLK` |
 | `mmap` / `mprotect` | `PROT_EXEC` blocked unless `prot_exec` or `thread` is pledged |
-| `sendto` | With `stdio`-only, destination address must be `NULL` (write to an already-connected socket) |
+| `sendto` | With `stdio`-only, destination address must be `NULL` |
 
 ---
 
@@ -204,8 +324,7 @@ with open("config.json") as f:
 # Phase 2: drop all file access
 pledge("stdio")
 
-# From here on, the process can only do computation and I/O on
-# already-open file descriptors (stdin/stdout/stderr)
+# From here on, only computation and stdout/stderr work
 result = expensive_computation(config)
 print(json.dumps(result))
 
@@ -224,103 +343,84 @@ import sys
 
 pledge("stdio rpath")
 
-# Can read any file the user has access to
 with open(sys.argv[1]) as f:
     reader = csv.DictReader(f)
     for row in reader:
         if float(row["amount"]) > 1000:
             print(f"{row['date']}: ${row['amount']}")
 
-# But cannot write, create, or delete anything
+# Cannot write, create, or delete anything
 # open("output.csv", "w")  → PermissionError
 # os.unlink("data.csv")    → PermissionError
 ```
 
 ### Network Client That Can't Touch the Filesystem
 
-Fetch data from the network but prevent any filesystem modification:
-
 ```python
 import socket
 import ssl
 from pledge import pledge
 
-# Import everything and set up SSL context BEFORE pledging
+# Set up SSL BEFORE pledging
 context = ssl.create_default_context()
 
 pledge("stdio rpath inet dns")
 
-# Can connect to servers
 sock = socket.create_connection(("example.com", 443))
 ssock = context.wrap_socket(sock, server_hostname="example.com")
 ssock.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 response = ssock.recv(4096)
 print(response.decode())
 
-# But cannot write to disk
+# Cannot write to disk or fork processes
 # open("/tmp/stolen.txt", "w")  → PermissionError
-
-# And cannot fork or exec
-# os.system("curl evil.com")    → PermissionError
 ```
 
 ### Progressive Privilege Dropping
-
-Narrow permissions as your program moves through phases:
 
 ```python
 from pledge import pledge
 import sqlite3
 
-# Phase 1: read config + database, allow network
+# Phase 1: read config, allow network
 pledge("stdio rpath inet dns")
 
 config = open("app.conf").read()
-conn = sqlite3.connect("data.db")  # inherits the open fd
+conn = sqlite3.connect("data.db")
 results = conn.execute("SELECT * FROM users").fetchall()
 
-# Phase 2: done reading files, only need network now
+# Phase 2: done reading files
 pledge("stdio inet")
 
-# conn still works because the fd is already open
-# But opening new files is blocked:
-# open("other.db")  → PermissionError
-
+# conn still works (fd already open), but new opens blocked
 send_results_to_api(results)
 
-# Phase 3: all done with network, just compute and print
+# Phase 3: computation only
 pledge("stdio")
 
-# Now even sockets are blocked
-# socket.socket()  → PermissionError
 print(f"Processed {len(results)} records")
 ```
 
 ### Worker Process Enclave
 
-Fork a worker that can only compute — no I/O, no files, no network:
+Fork a worker that can only compute:
 
 ```python
 from pledge import pledge
 import os
 import mmap
 
-# Create shared memory for communicating with the worker
 buf = mmap.mmap(-1, 4096)
 buf.write(b"input data here")
 
 pid = os.fork()
 if pid == 0:
-    # Worker process: maximum lockdown
     pledge("stdio")
 
-    # Can read/write the shared memory
     buf.seek(0)
     data = buf.read(15)
-    result = data.upper()  # "do work"
     buf.seek(0)
-    buf.write(result)
-
+    buf.write(data.upper())
     os._exit(0)
 
 os.waitpid(pid, 0)
@@ -330,28 +430,20 @@ print(buf.read(15))  # b"INPUT DATA HERE"
 
 ### Sandboxing Untrusted Plugins
 
-Load and run plugin code in a sandboxed subprocess:
-
 ```python
 from pledge import pledge
 import importlib
 import json
 import os
-import sys
 
 def run_plugin_sandboxed(plugin_name: str, input_data: dict) -> dict:
-    """Run a plugin with only stdio access — no files, no network."""
-
     r_fd, w_fd = os.pipe()
-
     pid = os.fork()
     if pid == 0:
         os.close(r_fd)
-
-        # Load the plugin before pledging
         plugin = importlib.import_module(f"plugins.{plugin_name}")
 
-        # Lock down: plugin can only compute and write results to pipe
+        # Lock down — plugin can only compute and write to pipe
         pledge("stdio")
 
         try:
@@ -359,7 +451,6 @@ def run_plugin_sandboxed(plugin_name: str, input_data: dict) -> dict:
             os.write(w_fd, json.dumps(result).encode())
         except Exception as e:
             os.write(w_fd, json.dumps({"error": str(e)}).encode())
-
         os._exit(0)
 
     os.close(w_fd)
@@ -368,21 +459,10 @@ def run_plugin_sandboxed(plugin_name: str, input_data: dict) -> dict:
         data += chunk
     os.close(r_fd)
     os.waitpid(pid, 0)
-
     return json.loads(data)
-
-# The plugin literally cannot:
-# - Read or write any file
-# - Open network connections
-# - Spawn processes
-# - Access the terminal
-# Even if it tries via ctypes or inline C
 ```
 
 ### Locked-Down Web Scraper
-
-Allow network access and reading files (for CA certs), but prevent
-any filesystem writes or process spawning:
 
 ```python
 import urllib.request
@@ -390,35 +470,18 @@ import ssl
 import json
 from pledge import pledge
 
-# Set up SSL before pledging
 context = ssl.create_default_context()
-
 pledge("stdio rpath inet dns")
 
-urls = [
-    "https://api.example.com/data1",
-    "https://api.example.com/data2",
-]
-
-results = []
+urls = ["https://api.example.com/data1", "https://api.example.com/data2"]
 for url in urls:
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, context=context) as resp:
-        results.append(json.loads(resp.read()))
+    with urllib.request.urlopen(url, context=context) as resp:
+        print(json.dumps(json.loads(resp.read()), indent=2))
 
-# Can print results but cannot save them to disk
-for r in results:
-    print(json.dumps(r, indent=2))
-
-# These would all fail:
-# open("results.json", "w")      → PermissionError
-# subprocess.run(["curl", url])  → PermissionError
-# os.system("rm -rf /")          → PermissionError
+# Cannot save results, spawn processes, or access terminal
 ```
 
 ### Protecting a CLI Tool From Itself
-
-Add pledge as a safety net to your own CLI applications:
 
 ```python
 #!/usr/bin/env python3
@@ -433,21 +496,15 @@ def main():
         sys.exit(1)
 
     pattern = re.compile(sys.argv[1])
-    files = sys.argv[2:]
 
-    # This tool only needs to read files and write to stdout.
-    # Lock it down before processing any input.
     if pledge_available():
         pledge("stdio rpath")
 
-    for filename in files:
-        try:
-            with open(filename) as f:
-                for lineno, line in enumerate(f, 1):
-                    if pattern.search(line):
-                        print(f"{filename}:{lineno}: {line}", end="")
-        except OSError as e:
-            print(f"{filename}: {e}", file=sys.stderr)
+    for filename in sys.argv[2:]:
+        with open(filename) as f:
+            for lineno, line in enumerate(f, 1):
+                if pattern.search(line):
+                    print(f"{filename}:{lineno}: {line}", end="")
 
 if __name__ == "__main__":
     main()
@@ -455,25 +512,18 @@ if __name__ == "__main__":
 
 ### Sandboxing AI Code Execution
 
-Run LLM-generated code with tight restrictions:
-
 ```python
 from pledge import pledge
 import os
-import sys
 import json
 
 def execute_ai_code(code: str, input_data: dict) -> dict:
-    """Execute untrusted code in a pledged subprocess."""
-
     r_fd, w_fd = os.pipe()
     pid = os.fork()
 
     if pid == 0:
         os.close(r_fd)
-
-        # Maximum restrictions: compute only, no I/O except the pipe
-        pledge("stdio")
+        pledge("stdio")  # maximum lockdown
 
         result = {"status": "ok", "output": None}
         try:
@@ -495,24 +545,158 @@ def execute_ai_code(code: str, input_data: dict) -> dict:
 
     if os.WIFSIGNALED(status):
         return {"status": "killed", "signal": os.WTERMSIG(status)}
-
     return json.loads(data)
 
 
-# The AI code literally cannot escape the sandbox:
-result = execute_ai_code("""
-output = sum(input_data["numbers"]) * 2
-""", {"numbers": [1, 2, 3, 4, 5]})
+# Safe: computation only
+r = execute_ai_code('output = sum(input_data["n"]) * 2', {"n": [1,2,3]})
+# → {"status": "ok", "output": 12}
 
-print(result)  # {"status": "ok", "output": 30}
+# Malicious: socket blocked
+r = execute_ai_code('import socket; socket.socket()', {})
+# → {"status": "error", "error": "[Errno 1] Operation not permitted"}
 
-# Malicious code gets EPERM on everything dangerous:
-result = execute_ai_code("""
-import socket  # import works (already in memory), but...
-s = socket.socket()  # PermissionError!
-""", {})
+# Malicious: file write blocked
+r = execute_ai_code('open("/tmp/pwned","w").write("hi")', {})
+# → {"status": "error", "error": "[Errno 1] Operation not permitted"}
+```
 
-print(result)  # {"status": "error", "error": "[Errno 1] ..."}
+### pledge + unveil Together: Full Sandbox
+
+This is the most secure pattern — controlling both operations and paths:
+
+```python
+from pledge import pledge, unveil, unveil_available
+import json
+
+# ── Phase 1: Set up path restrictions ──
+if unveil_available():
+    unveil("data/",    "r")       # read input data
+    unveil("output/",  "rwc")     # write results
+    unveil("/usr/lib", "r")       # shared libraries (already loaded)
+    unveil(None, None)            # commit — filesystem locked
+
+# ── Phase 2: Set up operation restrictions ──
+pledge("stdio rpath wpath cpath")
+
+# ── Now the process can: ──
+data = json.load(open("data/input.json"))        # ✓ unveiled path + rpath
+
+with open("output/result.json", "w") as f:       # ✓ unveiled path + wpath + cpath
+    json.dump({"processed": len(data)}, f)
+
+# ── But cannot: ──
+# open("/etc/passwd")            → EACCES (not unveiled)
+# open("/home/user/.ssh/id_rsa") → EACCES (not unveiled)
+# socket.socket()                → EPERM  (no inet promise)
+# os.fork()                      → EPERM  (no proc promise)
+# os.system("rm -rf /")          → EPERM  (no exec/proc promise)
+```
+
+### Web Server With Minimal Exposure
+
+```python
+import socket
+from pledge import pledge, unveil, unveil_available
+
+# Pre-load everything
+import json
+import mimetypes
+
+# Restrict filesystem to just the document root
+if unveil_available():
+    unveil("./public",     "r")     # serve files from here
+    unveil("./logs",       "rw")    # write access logs
+    unveil("/etc/ssl",     "r")     # TLS certificates
+    unveil("/usr/lib",     "r")     # shared libraries
+    unveil(None, None)
+
+# Restrict operations
+pledge("stdio rpath wpath inet")
+
+# Bind and serve
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("0.0.0.0", 8080))
+server.listen(128)
+
+while True:
+    client, addr = server.accept()
+    # serve files from ./public only
+    # even if an attacker finds a bug, they can't:
+    #   - read files outside ./public and ./logs
+    #   - execute programs
+    #   - escalate privileges
+    client.close()
+```
+
+### Read-Only Config With Private Temp
+
+```python
+from pledge import pledge, unveil, unveil_available
+
+# Typical application pattern: read config, write to temp
+if unveil_available():
+    unveil("/etc/myapp",   "r")     # config files
+    unveil("/tmp/myapp",   "rwc")   # scratch space
+    unveil("/var/log",     "rw")    # log files
+    unveil(None, None)
+
+pledge("stdio rpath wpath cpath tmppath")
+
+# Can read config
+config = open("/etc/myapp/settings.conf").read()
+
+# Can use temp files
+with open("/tmp/myapp/cache.dat", "w") as f:
+    f.write("cached data")
+
+# Cannot read sensitive files
+# open("/etc/shadow")     → EACCES (not unveiled)
+# open("/home/user/.ssh") → EACCES (not unveiled)
+```
+
+### Build System Sandbox
+
+Inspired by [Justine Tunney's Landlocked Make](https://justine.lol/make/) — restrict a build command to its declared inputs/outputs:
+
+```python
+from pledge import pledge, unveil, unveil_available
+import subprocess
+import sys
+
+def sandboxed_build(src_dirs: list[str], out_dir: str, cmd: list[str]):
+    """Run a build command with restricted filesystem access."""
+
+    if unveil_available():
+        # Source directories: read-only
+        for d in src_dirs:
+            unveil(d, "r")
+
+        # Output directory: full access
+        unveil(out_dir, "rwc")
+
+        # System directories needed for compilation
+        unveil("/usr/bin",     "rx")
+        unveil("/usr/lib",     "r")
+        unveil("/lib",         "r")
+        unveil("/tmp",         "rwc")
+        unveil(None, None)
+
+    pledge("stdio rpath wpath cpath exec prot_exec proc tmppath")
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(result.stdout)
+    if result.returncode != 0:
+        print(result.stderr, file=sys.stderr)
+    return result.returncode
+
+# The compiler can only read source and write to build/
+sandboxed_build(
+    src_dirs=["src/", "include/"],
+    out_dir="build/",
+    cmd=["gcc", "-o", "build/main", "src/main.c"]
+)
 ```
 
 ---
@@ -525,126 +709,132 @@ print(result)  # {"status": "error", "error": "[Errno 1] ..."}
 python3 pledge.py -p "stdio rpath" -- ls -la /etc/
 ```
 
-**Read a file:**
+**Read a file with path restrictions:**
 
 ```bash
-python3 pledge.py -p "stdio rpath" -- cat /etc/hostname
+# Only allow access to /etc — everything else is hidden
+python3 pledge.py -p "stdio rpath" -v /etc -- cat /etc/hostname
 ```
 
-**Run a shell with only read access (no writes, no network):**
+**Run a shell with only read access:**
 
 ```bash
 python3 pledge.py -p "stdio rpath tty" -- bash
-# Inside this shell:
-#   cat /etc/passwd    ✓ works
-#   echo hi > /tmp/x   ✗ Operation not permitted
-#   curl example.com   ✗ Operation not permitted
+# Inside:  cat /etc/passwd    ✓ works
+#          echo hi > /tmp/x   ✗ EPERM
+#          curl example.com   ✗ EPERM
 ```
 
-**Allow a script to write to the current directory:**
+**Grant write access to a specific directory:**
 
 ```bash
-python3 pledge.py -p "stdio rpath wpath cpath" -- python3 my_script.py
+python3 pledge.py -p "stdio rpath wpath cpath" -v rwc:. -- python3 my_script.py
 ```
 
-**Kill the process instead of returning EPERM:**
+**Unveil multiple paths with different permissions:**
+
+```bash
+python3 pledge.py \
+  -p "stdio rpath wpath cpath" \
+  -v /etc \
+  -v r:/usr/share \
+  -v rwc:/tmp \
+  -v rwc:. \
+  -- bash
+```
+
+**Kill process on violation (instead of EPERM):**
 
 ```bash
 python3 pledge.py --penalty kill -p "stdio rpath" -- python3 untrusted.py
-# Process receives SIGSYS and dies instantly on violation
 ```
 
-**Check if the system supports SECCOMP BPF:**
+**Check system capabilities:**
 
 ```bash
 $ python3 pledge.py --test
-pledge: seccomp BPF is available
-  kernel:  6.8.0
-  arch:    x86_64 (AUDIT_ARCH=0xC000003E)
+kernel:    6.8.0-45-generic
+arch:      x86_64 (AUDIT_ARCH=0xC000003E)
+pledge:    available (seccomp BPF)
+unveil:    available (Landlock ABI v4)
 ```
 
-**Inspect the BPF filter that would be generated:**
+**Inspect the BPF filter:**
 
 ```bash
 $ python3 pledge.py --dump -p "stdio rpath inet dns"
 Promises: stdio rpath inet dns
 BPF instructions: 280
 BPF program size: 2240 bytes
-Allowed syscalls (107): accept, accept4, access, arch_prctl, bind, ...
+Allowed syscalls (107): accept, accept4, access, ...
 ```
 
-**Run Python with network access but no filesystem writes:**
+**Disable unveil (pledge only):**
 
 ```bash
-python3 pledge.py -p "stdio rpath inet dns" -- python3 -c "
-import urllib.request
-print(urllib.request.urlopen('http://example.com').read()[:100])
-"
-```
-
-**Run a Node.js script with strict restrictions:**
-
-```bash
-python3 pledge.py -p "stdio rpath" -- node -e "
-const fs = require('fs');
-console.log(fs.readFileSync('/etc/hostname', 'utf8'));
-// fs.writeFileSync('/tmp/x', 'y');  ← would fail
-"
+python3 pledge.py -V -p "stdio rpath" -- ls -la
 ```
 
 ---
 
 ## How It Works
 
-1. **Promise parsing** — Your promise string (e.g. `"stdio rpath inet"`) is split into categories. Each category maps to a set of allowed syscall names.
+### pledge() — SECCOMP BPF
 
-2. **BPF compilation** — A `BPFBuilder` generates a SECCOMP BPF filter program (an array of `sock_filter` instructions). The program:
-   - Validates the CPU architecture (`AUDIT_ARCH_X86_64` or `AUDIT_ARCH_AARCH64`)
+1. **Promise parsing** — Your promise string is split into categories. Each maps to a set of allowed syscall names with optional argument constraints.
+
+2. **BPF compilation** — A `BPFBuilder` generates a SECCOMP BPF filter:
+   - Validates CPU architecture (`AUDIT_ARCH_X86_64` / `AUDIT_ARCH_AARCH64`)
    - Loads the syscall number from `seccomp_data.nr`
-   - For each allowed syscall, emits a conditional jump that returns `SECCOMP_RET_ALLOW`
-   - For filtered syscalls (`open`, `socket`, `ioctl`, `mmap`, etc.), emits argument-checking logic using `seccomp_data.args[]`
-   - Falls through to the default action (`SECCOMP_RET_ERRNO | EPERM` or `SECCOMP_RET_KILL_PROCESS`)
+   - For simple syscalls: conditional jump → `SECCOMP_RET_ALLOW`
+   - For filtered syscalls (`open`, `socket`, `ioctl`, `mmap`, etc.): loads `seccomp_data.args[]` and checks argument values
+   - Default: `SECCOMP_RET_ERRNO | EPERM` or `SECCOMP_RET_KILL_PROCESS`
 
-3. **Filter installation** — The compiled BPF program is installed via:
-   ```
-   prctl(PR_SET_NO_NEW_PRIVS, 1)          — required for unprivileged seccomp
-   prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)  — install the filter
-   ```
-   Both calls are made through `ctypes` with raw `syscall()` to avoid glibc wrapper issues.
+3. **Installation** via `prctl(PR_SET_NO_NEW_PRIVS, 1)` + `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)`.
 
-4. **Kernel enforcement** — Once installed, the filter is checked by the kernel before every system call for the lifetime of the process (and any children). It cannot be removed.
+### unveil() — Landlock LSM
+
+1. **Rule collection** — Each `unveil(path, perms)` call stores a path + access rights pair.
+
+2. **Ruleset creation** — On `unveil(None, None)`, calls:
+   - `landlock_create_ruleset()` with a bitmask of all access rights to deny by default
+   - `landlock_add_rule(LANDLOCK_RULE_PATH_BENEATH)` for each unveiled path, with an `O_PATH` fd and access bits
+   - `landlock_restrict_self()` to enforce
+
+3. **ABI negotiation** — Queries the Landlock ABI version and adjusts the handled access mask. Newer ABIs (v2: `REFER`, v3: `TRUNCATE`, v4: `IOCTL_DEV`) are used when available, older features degrade gracefully.
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│ pledge()    │────▶│ BPFBuilder   │────▶│ prctl()      │
-│ "stdio rp.."│     │ compile BPF  │     │ install      │
-└─────────────┘     └──────────────┘     └──────┬───────┘
-                                                │
-                         ┌──────────────────────▼───────┐
-                         │         Linux Kernel          │
-                         │                               │
-                         │  Every syscall ──▶ BPF check  │
-                         │    ✓ allowed  → run syscall   │
-                         │    ✗ denied   → EPERM / KILL  │
-                         └───────────────────────────────┘
+┌──────────┐    ┌─────────────┐    ┌──────────────┐
+│ pledge() │───▶│ BPFBuilder  │───▶│ prctl()      │
+│          │    │ (bytecode)  │    │ SECCOMP BPF  │
+└──────────┘    └─────────────┘    └──────┬───────┘
+                                          │
+┌──────────┐    ┌─────────────┐    ┌──────▼───────┐
+│ unveil() │───▶│ Landlock    │───▶│   Kernel     │
+│          │    │ ruleset     │    │              │
+└──────────┘    └─────────────┘    │  syscall ──▶ seccomp check
+                                   │  file op ──▶ landlock check
+                                   │    ✓ → allow
+                                   │    ✗ → EPERM / EACCES
+                                   └──────────────┘
 ```
 
 ---
 
 ## Architecture Support
 
-| Architecture | Supported | AUDIT_ARCH | Syscall table |
+| Architecture | pledge() | unveil() | AUDIT_ARCH |
 |---|---|---|---|
-| x86_64 / amd64 | ✓ | `0xC000003E` | ~180 entries |
-| aarch64 / arm64 | ✓ | `0xC00000B7` | ~170 entries |
+| x86_64 / amd64 | ✓ | ✓ | `0xC000003E` |
+| aarch64 / arm64 | ✓ | ✓ | `0xC00000B7` |
 
-Other architectures (i386, arm32, riscv64, s390x, ppc64) would need syscall number tables added to the `NR` dictionary.
+pledge() requires architecture-specific syscall number tables (~180 entries each). unveil() uses architecture-independent Landlock syscall numbers (444–446, same everywhere).
 
 ---
 
 ## Caveats
 
-**Import order matters.** Python's `import` machinery opens files, loads shared libraries, and sometimes creates executable memory. Do your imports *before* calling `pledge()`, or include `rpath` and `prot_exec` in your promises.
+**Import order matters.** Python's `import` machinery opens files and loads shared libraries. Do your imports *before* calling `pledge()` or `unveil()`.
 
 ```python
 # ✓ Correct: import before pledge
@@ -652,25 +842,38 @@ import json, csv, socket
 from pledge import pledge
 pledge("stdio")
 
-# ✗ Wrong: will fail when json tries to import submodules
+# ✗ Wrong: import triggers file operations that are blocked
 from pledge import pledge
 pledge("stdio")
 import json  # PermissionError!
 ```
 
-**No filesystem path filtering.** Unlike OpenBSD's `unveil()`, pledge.py cannot restrict *which* files are accessible — only *whether* file operations are allowed at all. If you need path-level restrictions, consider combining pledge with Linux namespaces, Landlock LSM (kernel ≥ 5.13), or a chroot.
+**unveil paths are resolved at call time.** Paths are resolved to real paths via `os.path.realpath()` when you call `unveil()`. Symlinks are followed. If a directory is removed and recreated after unveiling, access may be denied.
 
-**glibc internals.** glibc uses `futex`, `rseq`, `mremap`, and other syscalls internally even in single-threaded programs. The `stdio` promise includes these so that basic C library functions don't break. If you find a program that fails unexpectedly, run it under `strace` to see which syscall is getting `EPERM`.
+**unveil commits are batched on Linux.** Unlike OpenBSD where each `unveil()` call takes immediate effect, on Linux rules are collected and only enforced when you call `unveil(None, None)`. This is a Landlock limitation — the ruleset must be built atomically.
 
-**Cumulative filters.** Each call to `pledge()` installs an *additional* SECCOMP filter. The kernel evaluates all installed filters and takes the most restrictive result. This means you can narrow privileges but never widen them — exactly like OpenBSD.
+**glibc internals.** glibc uses `futex`, `rseq`, `mremap`, and other syscalls internally. The `stdio` promise includes these. If a program fails unexpectedly, run it under `strace` to see which syscall is getting `EPERM`.
 
-**No `execpromises`.** The Linux SECCOMP mechanism doesn't support different promise sets for `execve`'d programs the way OpenBSD does. The `execpromises` parameter is accepted but ignored with a warning.
+**Cumulative filters.** Each `pledge()` call installs an additional SECCOMP filter. Each `unveil(None, None)` call enforces an additional Landlock domain. The kernel takes the most restrictive result across all layers.
+
+**No `execpromises`.** Linux SECCOMP doesn't support different promise sets post-`execve`. The `execpromises` parameter is accepted but ignored.
+
+**Landlock ABI evolution.** Landlock gains new capabilities with each kernel version. pledge.py queries the ABI version and adapts:
+
+| ABI | Kernel | New capability |
+|-----|--------|----------------|
+| v1 | 5.13 | Basic filesystem access control |
+| v2 | 5.19 | File reparenting (`REFER`) |
+| v3 | 6.2 | File truncation (`TRUNCATE`) |
+| v4 | 6.8 | Device ioctl (`IOCTL_DEV`) |
+
+On older ABIs, newer access rights are silently omitted from the handled mask.
 
 ---
 
 ## Requirements
 
-- **Linux** kernel ≥ 3.5 (SECCOMP_MODE_FILTER support)
+- **Linux** kernel ≥ 3.5 for pledge (SECCOMP), ≥ 5.13 for unveil (Landlock)
 - **Python** ≥ 3.10
 - **No root** — uses `PR_SET_NO_NEW_PRIVS` for unprivileged operation
 - **No dependencies** — pure standard library + `ctypes`
