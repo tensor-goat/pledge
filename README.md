@@ -892,4 +892,4 @@ On older ABIs, newer access rights are silently omitted from the handled mask.
 
 ## License
 
-Based on Justine Tunney's [cosmopolitan libc pledge() implementation](https://justine.lol/pledge/), which is ISC licensed. This Python port is released under the same terms.
+Based on Justine Tunney's [cosmopolitan libc pledge() implementation](https://justine.lol/pledge/), which is ISC licensed.
